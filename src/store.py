@@ -17,7 +17,7 @@ import time
 import unicodedata
 from collections import OrderedDict
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -254,6 +254,12 @@ EPHEMERAL_TTL_SECONDS = config.EPHEMERAL_TTL_SECONDS
 
 class StoreError(ValueError):
     """Caller-supplied input rejected. Maps to HTTP 400."""
+
+
+class StorePermissionError(StoreError):
+    """A write lost an authorization race. Maps to HTTP 403."""
+
+    status = 403
 
 
 class StoreConflictError(ValueError):
@@ -1295,6 +1301,7 @@ def append(
     text: str,
     did: str | None = None,
     nonce: int | None = None,
+    unowned: bool = False,
 ) -> dict:
     """Append a message, and announce the room the first time it appears.
 
@@ -1311,7 +1318,7 @@ def append(
     primitive that already exists does the rest — `?since=` for incremental reads,
     `?format=json`, `?wait=` for near-real-time, ring retention, the same rate limits.
     """
-    rec, created = _write_record(root, room, nick, text, did=did, nonce=nonce)
+    rec, created = _write_record(root, room, nick, text, did, nonce, unowned)
     # Counted here rather than in `_write_record`, so the server's own announcements
     # (`_log_event` writes one per created room) never inflate the message count. This
     # counts what callers wrote, which is what "new messages" has to mean.
@@ -1366,6 +1373,7 @@ def _write_record(
     text: str,
     did: str | None = None,
     nonce: int | None = None,
+    unowned: bool = False,
 ) -> tuple[dict, bool]:
     """Write one record. Returns (record, created) — `created` is True when this call is
     what brought the room into existence, which is the signal `append` announces on."""
@@ -1400,6 +1408,8 @@ def _write_record(
         # Under the lock, before the write: two concurrent first-writers must not both
         # decide they created the room and announce it twice.
         created = not path.exists()
+        if unowned and note_get(root, OWNERS_NS, room) is not None:
+            raise StorePermissionError("ownership changed while waiting; retry signed")
         # Also under the lock, or two concurrent replays of one captured URL would both
         # read the same "last nonce" and both write.
         if did is not None:
@@ -1495,6 +1505,7 @@ def note_set(
     value: str,
     expect: str | None = None,
     expect_absent: bool = False,
+    claim_owner: bool = False,
 ) -> dict:
     """Write a note, optionally only if it still holds what the caller last read.
 
@@ -1512,15 +1523,18 @@ def note_set(
     path = note_path(root, ns, key)
     value = clean_text(value, MAX_VALUE_CHARS)
     _reap(root)
-    # The global half only, and only for a create. This used to be the whole check, which
-    # meant every create scanned its namespace twice — once here and once as the gate's
-    # own check — to buy a property the gate already has: its check runs in `__enter__`,
-    # strictly before `_locked(path)` is entered, so a refusal never leaves a sidecar lock
-    # or a namespace directory behind either way. What this call is actually worth is
-    # shedding a full store's worth of refusals without queueing for the gate first.
+    # When claiming ownership, also hold the room lock so the claim serialises against
+    # the first message — without it a claim and a first message race on different locks
+    # and both succeed, leaving the forbidden owner-plus-preexisting-message state.
+    room_gate = _locked(root / ".rooms-create") if claim_owner else nullcontext()
+    room_lock = _locked(room_path(root, key)) if claim_owner else nullcontext()
+    # The global half only, and only for a create. This sheds a full store's refusals
+    # without queueing for the gate; its check inside the gate stays authoritative.
     if not path.exists():
         _check_note_total(root)
     with (
+        room_gate,
+        room_lock,
         _create_gate(
             root / ".notes-create",
             path,
@@ -1529,9 +1543,11 @@ def note_set(
         ),
         _locked(path),
     ):
-        if expect_absent or expect is not None:
+        if claim_owner and last_seq(root, key):
+            raise StorePermissionError(f"/r/{key} already has messages")
+        if claim_owner or expect_absent or expect is not None:
             current = path.read_text(encoding="utf-8") if path.exists() else None
-            if expect_absent and current is not None:
+            if (claim_owner or expect_absent) and current is not None:
                 config._dbg(2, "cas_conflict", ns=ns, key=key, found="exists")
                 raise StoreConflictError(f"note {ns}/{key} already exists", current)
             if expect is not None and current != expect:

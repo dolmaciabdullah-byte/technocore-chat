@@ -862,6 +862,8 @@ def _room_write_gate(request: Request, room: str, signer: str | None) -> Respons
                 f"keys with a signed write to /kv/{store.ALLOW_NS}/{room}.",
                 403,
             )
+    else:
+        request.scope["require_unowned_room"] = True
     # Last, so a token is only ever spent on a write that would otherwise have been
     # accepted: an IP hammering a mailbox it cannot write to does not also burn the room
     # budget it never got to use.
@@ -979,6 +981,11 @@ def _already_written(request: Request, key: tuple, room: str, left: int) -> Resp
     return respond(request, {**view, "posted": posted}, note=budget_note("write", left, RATE_WRITE))
 
 
+def _append(request: Request, *args, **kwargs) -> dict:
+    kwargs["unowned"] = request.scope.pop("require_unowned_room", False)
+    return store.append(config.ROOT, *args, **kwargs)
+
+
 def room_say(request: Request) -> Response:
     left, retry = take(request, "write", RATE_WRITE)
     if retry:
@@ -992,7 +999,7 @@ def room_say(request: Request) -> Response:
     replay = _already_written(request, key, room, left)
     if replay is not None:
         return replay
-    rec = store.append(config.ROOT, room, nick, body)
+    rec = _append(request, room, nick, body)
     limit.remember_write(key, rec["seq"], time.monotonic(), DEDUP_SECONDS, MAX_RECENT_WRITES)
     config._dbg(3, "write", room=room, seq=rec["seq"], chars=len(rec["text"]))
     limit._settle_room_budget(request, rec, RATE_ROOMS_PER_DAY, ip_header=CLIENT_IP_HEADER)
@@ -1021,7 +1028,7 @@ def room_say_signed(request: Request) -> Response:
     denied = _room_write_gate(request, room, signer)
     if denied:
         return denied
-    rec = store.append(config.ROOT, room, "", body, did=signer, nonce=int(nonce))
+    rec = _append(request, room, "", body, did=signer, nonce=int(nonce))
     config._dbg(3, "write", room=room, seq=rec["seq"], chars=len(rec["text"]))
     limit._settle_room_budget(request, rec, RATE_ROOMS_PER_DAY, ip_header=CLIENT_IP_HEADER)
     view = store.read_messages(config.ROOT, room, limit=20)
@@ -1121,12 +1128,12 @@ async def room_post(request: Request) -> Response:
             replay = _already_written(request, key, room, left)
             if replay is not None:
                 return replay
-            posted = store.append(config.ROOT, room, nick, sent)
+            posted = _append(request, room, nick, sent)
             limit.remember_write(
                 key, posted["seq"], time.monotonic(), DEDUP_SECONDS, MAX_RECENT_WRITES
             )
         else:
-            posted = store.append(config.ROOT, room, "", body, did=signer, nonce=int(nonce))
+            posted = _append(request, room, "", body, did=signer, nonce=int(nonce))
         config._dbg(3, "write", room=room, seq=posted["seq"], chars=len(posted["text"]))
         limit._settle_room_budget(request, posted, RATE_ROOMS_PER_DAY, ip_header=CLIENT_IP_HEADER)
         return respond(
@@ -1175,7 +1182,7 @@ def _condition(source: dict) -> tuple[str | None, bool]:
     return (str(expect) if expect is not None else None), False
 
 
-def _note_write_gate(ns: str, key: str, value: str, signer: str | None) -> Response | None:
+def _note_write_gate(ns: str, key: str, value: str, signer: str | None) -> Response | bool:
     """Two reserved namespaces carry room ownership, and only those two take signed writes.
 
     Not a general signed-kv system: a note is world-writable by design and stays that way,
@@ -1198,7 +1205,7 @@ def _note_write_gate(ns: str, key: str, value: str, signer: str | None) -> Respo
                 f"/kv/{ns}/{key}/set/<value>.",
                 400,
             )
-        return None
+        return False
     if ns == store.OWNERS_NS:
         if not store.ownable(key):
             return text(
@@ -1244,7 +1251,7 @@ def _note_write_gate(ns: str, key: str, value: str, signer: str | None) -> Respo
                 "take over a conversation already in progress.",
                 403,
             )
-        return None
+        return current is None
     owner = store.note_get(config.ROOT, store.OWNERS_NS, key)
     if owner is None:
         return text(
@@ -1267,7 +1274,7 @@ def _note_write_gate(ns: str, key: str, value: str, signer: str | None) -> Respo
             "is not one. Fail closed: a list with an unparseable entry lets nobody in.",
             400,
         )
-    return None
+    return False
 
 
 def note_write(request: Request) -> Response:
@@ -1276,9 +1283,9 @@ def note_write(request: Request) -> Response:
         return limit.limited("write", RATE_WRITE, retry, text=text, max_wait=MAX_WAIT)
     p = request.path_params
     value = store.clean_text(p["value"], store.MAX_VALUE_CHARS)
-    denied = _note_write_gate(p["ns"], p["key"], value, None)
-    if denied:
-        return denied
+    gate = _note_write_gate(p["ns"], p["key"], value, None)
+    if isinstance(gate, Response):
+        return gate
     expect, expect_absent = _condition(dict(request.query_params))
     meta = store.note_set(
         config.ROOT, p["ns"], p["key"], value, expect=expect, expect_absent=expect_absent
@@ -1330,14 +1337,14 @@ def note_write_signed(request: Request) -> Response:
     signer = _signer(p["did"], p["sig"], nonce, f"{ns}|{key}|{nonce}|{value}")
     if isinstance(signer, Response):
         return signer
-    denied = _note_write_gate(ns, key, value, signer)
-    if denied:
-        return denied
+    gate = _note_write_gate(ns, key, value, signer)
+    if isinstance(gate, Response):
+        return gate
     denied = _burn_nonce(key, nonce)
     if denied:
         return denied
     expect, expect_absent = _condition(dict(request.query_params))
-    meta = store.note_set(config.ROOT, ns, key, value, expect=expect, expect_absent=expect_absent)
+    meta = store.note_set(config.ROOT, ns, key, value, expect, expect_absent, gate)
     return respond(
         request,
         meta,
@@ -1373,16 +1380,14 @@ async def note_post(request: Request) -> Response:
     # note, the nonce burn is a compare-and-swap on disk, and note_set walks the notes tree
     # to enforce the global cap. None of that may run on the loop from an `async def`.
     def write() -> Response:
-        denied = _note_write_gate(ns, key, value, signer)
-        if denied:
-            return denied
+        gate = _note_write_gate(ns, key, value, signer)
+        if isinstance(gate, Response):
+            return gate
         if signer is not None:
             burned = _burn_nonce(key, nonce)
             if burned:
                 return burned
-        meta = store.note_set(
-            config.ROOT, ns, key, value, expect=expect, expect_absent=expect_absent
-        )
+        meta = store.note_set(config.ROOT, ns, key, value, expect, expect_absent, gate)
         return respond(
             request,
             meta,
@@ -1634,7 +1639,7 @@ async def on_method_not_allowed(request: Request, exc: Exception) -> Response:
 
 
 async def on_bad_input(request: Request, exc: Exception) -> Response:
-    return text(f"400 {exc}", 400)
+    return text(f"{(status := getattr(exc, 'status', 400))} {exc}", status)
 
 
 async def on_conflict(request: Request, exc: Exception) -> Response:

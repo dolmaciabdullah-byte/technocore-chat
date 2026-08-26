@@ -839,6 +839,95 @@ def test_two_first_claims_cannot_both_create_one_nonce_counter(client, tmp_path,
     assert store.note_get(tmp_path, store.OWNERS_NS, "d-first") is None
 
 
+def test_two_concurrent_first_claims_do_not_both_succeed(client, tmp_path, monkeypatch):
+    """TOCTOU: _note_write_gate reads the owner note without a lock, so two concurrent
+    first claims both see None and both pass the gate. The fix forces expect_absent=True
+    on the note_set call when the gate signals a first-time claim, so the second writer
+    gets a 409 from the CAS instead of silently stealing the room."""
+    import store
+
+    alice, alice_sign = _keypair(seed=1)
+    bob, bob_sign = _keypair(seed=2)
+    owner_path = store.note_path(tmp_path, store.OWNERS_NS, "d-race")
+
+    # Simulate: Alice's claim lands in the gap between Bob's gate check and Bob's note_set.
+    def alice_claims():
+        owner_path.parent.mkdir(parents=True, exist_ok=True)
+        owner_path.write_text(alice, encoding="utf-8")
+
+    raced = _race_before_lock(monkeypatch, store, owner_path, alice_claims)
+    lost = _claim(client, "d-race", bob, bob_sign)
+
+    assert raced, "the race never happened — this test proved nothing"
+    assert lost.status_code == 409
+    # Alice's claim survives: the room belongs to Alice, not Bob.
+    assert store.note_get(tmp_path, store.OWNERS_NS, "d-race") == alice
+
+
+def test_claim_vs_first_message_do_not_both_succeed(client, tmp_path, monkeypatch):
+    """Birth-race: a first ownership claim and a first message race on different
+    locks (the note lock and the room lock).  Without coordination both succeed,
+    leaving the forbidden owner-plus-preexisting-message state.  The fix holds the
+    room lock inside note_set when claim_owner=True, so the claim and the first
+    message serialise against each other."""
+    import orjson
+
+    import store
+
+    owner, owner_sign = _keypair()
+    room = "d-birth"
+    room_file = store.room_path(tmp_path, room)
+
+    # Simulate a concurrent first message by writing directly to the room file,
+    # bypassing locks (as another process would have its own FD).  This happens
+    # just before note_set acquires the room lock under claim_owner=True.
+    def first_message():
+        room_file.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"seq": 1, "ts": "2026-01-01T00:00:00Z", "from": "stranger", "text": "hi"}
+        room_file.write_bytes(orjson.dumps(rec) + b"\n")
+
+    raced = _race_before_lock(monkeypatch, store, room_file, first_message)
+    result = _claim(client, room, owner, owner_sign)
+
+    assert raced, "the race never happened — this test proved nothing"
+    # The claim must fail: the room already has a message.
+    assert result.status_code == 403
+    # No owner was set.
+    assert store.note_get(tmp_path, store.OWNERS_NS, room) is None
+    # The first message is intact.
+    assert store.last_seq(tmp_path, room) == 1
+
+
+def test_first_message_vs_claim_do_not_both_succeed(client, tmp_path, monkeypatch):
+    """The reverse of test_claim_vs_first_message: a message write to an ownable
+    room races against a concurrent ownership claim.  The message path re-checks
+    ownership under the room lock (via the unowned flag), so a claim that landed
+    between the gate and the lock causes a 403."""
+    import store
+
+    owner, owner_sign = _keypair()
+    room = "d-birth2"
+    room_file = store.room_path(tmp_path, room)
+
+    # Simulate: a claim lands between the gate check and _write_record's lock.
+    # Write the owner note directly, as a concurrent process would.
+    def claim_race():
+        p = store.note_path(tmp_path, store.OWNERS_NS, room)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(owner, encoding="utf-8")
+
+    raced = _race_before_lock(monkeypatch, store, room_file, claim_race)
+    result = client.get(f"/r/{room}/say/stranger/hello")
+
+    assert raced, "the race never happened — this test proved nothing"
+    # The message must fail: the room is now owned.
+    assert result.status_code == 403
+    # The owner's claim survives.
+    assert store.note_get(tmp_path, store.OWNERS_NS, room) == owner
+    # No message was written.
+    assert store.last_seq(tmp_path, room) == 0
+
+
 def test_note_capacity_walk_is_cached_and_a_note_write_invalidates_it(client, monkeypatch):
     """The note walk is the expensive half of /rooms (~41k stats at the cap) and changes
     only when a note is written or reaped, so it lives behind its own generation-stamped

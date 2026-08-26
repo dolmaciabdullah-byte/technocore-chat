@@ -115,6 +115,11 @@ def test_b58_leading_zero_bytes_round_trip():
     # A payload with two leading zero bytes
     payload = b"\x00\x00" + b"\xab" * 32
     encoded = _multibase(payload)
+    # The encoder must emit one '1' per leading 0x00 byte — if it doesn't,
+    # the decoder has nothing to recover and the round-trip silently shrinks.
+    assert encoded.startswith("11"), (
+        f"encoder must emit leading '1's for 0x00 bytes, got {encoded[:4]!r}"
+    )
     decoded = didkey._b58decode(encoded)
     assert decoded == payload, (
         f"leading zeros lost: encoded {len(payload)}B, decoded {len(decoded)}B"

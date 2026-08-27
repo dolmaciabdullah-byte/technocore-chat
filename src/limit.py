@@ -280,8 +280,12 @@ def take(request, kind, per_min, burst=None, *, ip_header="", max_buckets=MAX_BU
         wait = 0.0
     else:
         wait = (1.0 - tokens) * 60.0 / per_min
+    # pop-then-insert, not move_to_end: a concurrent evictor's popitem
+    # can remove the key between __setitem__ and move_to_end(), raising
+    # KeyError.  Same fix applied to _rooms_cache (app.py) and
+    # _window_memo (store.py).  Closes #378.
+    _buckets.pop((ip, kind), None)
     _buckets[(ip, kind)] = (tokens, now)
-    _buckets.move_to_end((ip, kind))
     while len(_buckets) > max_buckets:
         _buckets.popitem(last=False)
     # Counted at the one point every rate-limited route already funnels through, so a new
